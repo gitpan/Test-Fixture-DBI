@@ -1,0 +1,225 @@
+#line 1
+package Test::mysqld;
+
+use strict;
+use warnings;
+
+use 5.008;
+use Class::Accessor::Lite;
+use Cwd;
+use DBI;
+use File::Temp qw(tempdir);
+use POSIX qw(SIGTERM WNOHANG);
+use Time::HiRes qw(sleep);
+
+our $VERSION = '0.11';
+
+our $errstr;
+our @SEARCH_PATHS = qw(/usr/local/mysql);
+
+my %Defaults = (
+    auto_start       => 2,
+    base_dir         => undef,
+    my_cnf           => {},
+    mysql_install_db => undef,
+    mysqld           => undef,
+    pid              => undef,
+    _owner_pid       => undef,
+);
+
+Class::Accessor::Lite->mk_accessors(keys %Defaults);
+
+sub new {
+    my $klass = shift;
+    my $self = bless {
+        %Defaults,
+        @_ == 1 ? %{$_[0]} : @_,
+        _owner_pid => $$,
+    }, $klass;
+    $self->my_cnf({
+        %{$self->my_cnf},
+    });
+    if (defined $self->base_dir) {
+        $self->base_dir(cwd . '/' . $self->base_dir)
+            if $self->base_dir !~ m|^/|;
+    } else {
+        $self->base_dir(
+            tempdir(
+                CLEANUP => $ENV{TEST_MYSQLD_PRESERVE} ? undef : 1,
+            ),
+        );
+    }
+    $self->my_cnf->{socket} ||= $self->base_dir . "/tmp/mysql.sock";
+    $self->my_cnf->{datadir} ||= $self->base_dir . "/var";
+    $self->my_cnf->{'pid-file'} ||= $self->base_dir . "/tmp/mysqld.pid";
+    if (! defined $self->mysql_install_db) {
+        my $prog = _find_program(qw/mysql_install_db bin scripts/)
+            or return;
+        $self->mysql_install_db($prog);
+    }
+    if (! defined $self->mysqld) {
+        my $prog = _find_program(qw/mysqld bin libexec/)
+            or return;
+        $self->mysqld($prog);
+    }
+    die 'mysqld is already running (' . $self->my_cnf->{'pid-file'} . ')'
+        if -e $self->my_cnf->{'pid-file'};
+    if ($self->auto_start) {
+        $self->setup
+            if $self->auto_start >= 2;
+        $self->start;
+    }
+    $self;
+}
+
+sub DESTROY {
+    my $self = shift;
+    $self->stop
+        if defined $self->pid && $$ == $self->_owner_pid;
+}
+
+sub dsn {
+    my ($self, %args) = @_;
+    $args{port} ||= $self->my_cnf->{port}
+        if $self->my_cnf->{port};
+    if (defined $args{port}) {
+        $args{host} ||= $self->my_cnf->{'bind-address'} || '127.0.0.1';
+    } else {
+        $args{mysql_socket} ||= $self->my_cnf->{socket};
+    }
+    $args{user} ||= 'root';
+    $args{dbname} ||= 'test';
+    return 'DBI:mysql:' . join(';', map { "$_=$args{$_}" } sort keys %args);
+}
+
+sub start {
+    my $self = shift;
+    return
+        if defined $self->pid;
+    open my $logfh, '>>', $self->base_dir . '/tmp/mysqld.log'
+        or die 'failed to create log file:' . $self->base_dir
+            . "/tmp/mysqld.log:$!";
+    my $pid = fork;
+    die "fork(2) failed:$!"
+        unless defined $pid;
+    if ($pid == 0) {
+        open STDOUT, '>&', $logfh
+            or die "dup(2) failed:$!";
+        open STDERR, '>&', $logfh
+            or die "dup(2) failed:$!";
+        exec(
+            $self->mysqld,
+            '--defaults-file=' . $self->base_dir . '/etc/my.cnf',
+            '--user=root',
+        );
+        die "failed to launch mysqld:$?";
+    }
+    close $logfh;
+    while (! -e $self->my_cnf->{'pid-file'}) {
+        if (waitpid($pid, WNOHANG) > 0) {
+            die "*** failed to launch mysqld ***\n" . do {
+                my $log = '';
+                if (open $logfh, '<', $self->base_dir . '/tmp/mysqld.log') {
+                    $log = do { local $/; <$logfh> };
+                    close $logfh;
+                }
+                $log;
+            };
+        }
+        sleep 0.1;
+    }
+    $self->pid($pid);
+    { # create 'test' database
+        my $dbh = DBI->connect($self->dsn(dbname => 'mysql'))
+            or die $DBI::errstr;
+        $dbh->do('CREATE DATABASE IF NOT EXISTS test')
+            or die $dbh->errstr;
+    }
+}
+
+sub stop {
+    my ($self, $sig) = @_;
+    return
+        unless defined $self->pid;
+    $sig ||= SIGTERM;
+    kill $sig, $self->pid;
+    while (waitpid($self->pid, 0) <= 0) {
+    }
+    $self->pid(undef);
+    # might remain for example when sending SIGKILL
+    unlink $self->my_cnf->{'pid-file'};
+}
+
+sub setup {
+    my $self = shift;
+    # (re)create directory structure
+    mkdir $self->base_dir;
+    for my $subdir (qw/etc var tmp/) {
+        mkdir $self->base_dir . "/$subdir";
+    }
+    # my.cnf
+    open my $fh, '>', $self->base_dir . '/etc/my.cnf'
+        or die "failed to create file:" . $self->base_dir . "/etc/my.cnf:$!";
+    print $fh "[mysqld]\n";
+    print $fh map {
+        my $v = $self->my_cnf->{$_};
+        defined $v && length $v
+            ? "$_=$v" . "\n"
+                : "$_\n";
+    } sort keys %{$self->my_cnf};
+    close $fh;
+    # mysql_install_db
+    if (! -d $self->base_dir . '/var/mysql') {
+        my $cmd = $self->mysql_install_db;
+        my $mysql_base_dir = $self->mysql_install_db;
+        if ($mysql_base_dir =~ s|/[^/]+/mysql_install_db$||) {
+            $cmd .= " --basedir='$mysql_base_dir'";
+        }
+        $cmd .= " --defaults-file='" . $self->base_dir . "/etc/my.cnf' 2>&1";
+        open $fh, '-|', $cmd
+            or die "failed to spawn mysql_install_db:$!";
+        my $output;
+        while (my $l = <$fh>) {
+            $output .= $l;
+        }
+        close $fh
+            or die "*** mysql_install_db failed ***\n$output\n";
+    }
+}
+
+sub _find_program {
+    my ($prog, @subdirs) = @_;
+    undef $errstr;
+    my $path = _get_path_of($prog);
+    return $path
+        if $path;
+    for my $mysql (_get_path_of('mysql'),
+                   map { "$_/bin/mysql" } @SEARCH_PATHS) {
+        if (-x $mysql) {
+            for my $subdir (@subdirs) {
+                $path = $mysql;
+                if ($path =~ s|/bin/mysql$|/$subdir/$prog|
+                        and -x $path) {
+                    return $path;
+                }
+            }
+        }
+    }
+    $errstr = "could not find $prog, please set appropriate PATH";
+    return;
+}
+
+sub _get_path_of {
+    my $prog = shift;
+    my $path = `which $prog 2> /dev/null`;
+    chomp $path
+        if $path;
+    $path = ''
+        unless -x $path;
+    $path;
+}
+
+1;
+__END__
+
+#line 300
