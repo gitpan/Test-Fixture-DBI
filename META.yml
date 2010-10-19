@@ -24,15 +24,14 @@ requires:
   Exporter: 0
   File::Temp: 0
   Getopt::Long: 0
-  Kwalify: 0
-  Params::Validate: 0
   Pod::Usage: 0
   SQL::Abstract: 0
   SQL::Abstract::Plugin::InsertMulti: 0
+  Scalar::Util: 0
   UNIVERSAL::require: 0
   YAML::Syck: 0
   parent: 0
 resources:
   license: http://dev.perl.org/licenses/
   repository: git://github.com/zigorou/p5-test-fixture-dbi.git
-version: 0.03
+version: 0.05
